@@ -51,6 +51,7 @@ where
     closure(ptr)
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use core::slice;
