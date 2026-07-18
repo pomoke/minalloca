@@ -1,5 +1,5 @@
 use std::{
-    arch::{asm, naked_asm}, mem::{MaybeUninit, forget}, ptr,
+    arch::asm, mem::forget, ptr,
 };
 
 /// Allocate memory on stack
@@ -10,9 +10,9 @@ use std::{
 ///   and result in segmentation fault.
 /// - Your program may inadvertently break, or have UBs.
 /// 
-/// # Caveats 
-/// - 
-pub unsafe fn alloca_raw_with<F>(count: usize, callback: F)
+/// # Known Caveats 
+/// - May not work with Address Sanitizer.
+pub unsafe fn with_alloca_raw<F>(count: usize, callback: F)
 where
     F: FnOnce(*mut u8),
 {
@@ -52,12 +52,27 @@ where
 }
 
 mod tests {
+    use core::slice;
     use super::*;
 
     #[test]
-    fn it_works() {
-        unsafe {alloca_raw_with(128, |ptr| {
+    fn test_alloca_run() {
+        unsafe {with_alloca_raw(128, |ptr| {
             println!("hello, world!");
         });}
     }
+
+    #[test]
+    fn test_alloca_as_slice() {
+    unsafe {with_alloca_raw(24, |ptr| {
+        let bytes: &mut [u8] = slice::from_raw_parts_mut(ptr, 24);
+        for i in bytes.iter_mut() {
+            *i = 'a' as u8;
+        }
+        let s = str::from_utf8(bytes).unwrap();
+        println!("{}",s);
+
+        println!("hello, world!");
+    });}
+}
 }
