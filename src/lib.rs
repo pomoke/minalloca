@@ -2,16 +2,18 @@ use std::{
     arch::asm, mem::forget, ptr,
 };
 
-/// Allocate memory on stack
+/// Allocates `[u8; count]` of memory on stack, then run
+/// the given closure with the allocation.
 /// 
 /// # Safety
-/// - Do not use a too large `count`. Even if the stack have enough space, 
+/// - Don't use a too large `count`. Even if the stack have enough space, 
 ///   access may go over guard page,
 ///   and result in segmentation fault.
 /// - Your program may inadvertently break, or have UBs.
 /// 
 /// # Known Caveats 
-/// - May not work with Address Sanitizer.
+/// - May not work with AddressSanitizer.
+/// - Migration to `#[unsafe(naked)]` is ongoing.
 pub unsafe fn with_alloca_raw<F>(count: usize, callback: F)
 where
     F: FnOnce(*mut u8),
