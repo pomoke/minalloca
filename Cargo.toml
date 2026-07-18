@@ -2,5 +2,10 @@
 name = "minalloca"
 version = "0.1.0"
 edition = "2024"
+description = "alloca() without external toolchain"
+license = "MIT"
+keywords = ["stack", "alloca"]
+categories = ["memory-management"]
+repository = "https://github.com/pomoke/minalloca"
 
 [dependencies]
