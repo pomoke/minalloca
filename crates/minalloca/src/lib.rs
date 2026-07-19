@@ -15,7 +15,7 @@ use std::{
 ///
 /// # Known Caveats
 /// - May not work with AddressSanitizer.
-/// - Will not unwind properly on panic.
+/// - Seems to unwind on panic, but it's unsure for now.
 pub unsafe fn with_alloca_raw<F>(count: usize, callback: F)
 where
     F: FnOnce(*mut u8),
@@ -31,26 +31,34 @@ where
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn alloca_trampoline(count: usize, callback: *mut u8, call_wrapper: *mut u8) {
+unsafe extern "C-unwind" fn alloca_trampoline(count: usize, callback: *mut u8, call_wrapper: *mut u8) {
     naked_asm!(
+        ".cfi_startproc",
         "push rbp", // Epilogue - keep bp
-        "push r12",
+        ".cfi_def_cfa rsp, 16",  // size of ret and rbp
+        ".cfi_offset rbp, -16", // Stack grows down.
         "mov rbp, rsp",
+        ".cfi_def_cfa_register rbp",
+        "push r12",
+        ".cfi_offset r12, -24",
+
         "mov r12, rsp", // Stash original sp on callee-save reg
         "and rsp, -16", // Align sp to 16-bytes
         "sub rsp, rdi", // reserve `count` of size
-        "and rsp, -16", // Align sp to 16-bytes
+        "and rsp, -16", // Align sp to 16-bytes align
         "mov rdi, rsp", // param 1 for wrapper
         "",             // callback function is both 2-nd arg
         "call rdx",
         "mov rsp, r12", //restore sp
         "pop r12",
         "pop rbp",      // restore frame
+        ".cfi_def_cfa_register rbp",
         "ret",
+        ".cfi_endproc",
     )
 }
 
-unsafe extern "C" fn callback_as_c<F>(ptr: *mut u8, call: *mut u8)
+unsafe extern "C-unwind" fn callback_as_c<F>(ptr: *mut u8, call: *mut u8)
 where
     F: FnOnce(*mut u8),
 {
@@ -67,7 +75,7 @@ mod tests {
     #[test]
     fn test_alloca_run() {
         unsafe {
-            with_alloca_raw(128, |ptr| {
+            with_alloca_raw(128, |_ptr| {
                 println!("hello, world!");
             });
         }
@@ -92,14 +100,14 @@ mod tests {
     #[test]
     fn test_alloca_closure() {
         unsafe {
-            let mut a = String::new();
             with_alloca_raw(24, |ptr| {
                 let bytes: &mut [u8] = slice::from_raw_parts_mut(ptr, 24);
-                for i in 0..4 {
-                    a.push_str("ab");
+                for i in 0..8 {
+                    bytes[i] = 'a' as u8;
                 }
+                let bytes = str::from_utf8_unchecked(&bytes[0..8]);
+                assert_eq!(bytes, "aaaaaaaa");
             });
-            assert_eq!(a, "abababab");
         }
     }
 
@@ -107,7 +115,7 @@ mod tests {
     #[should_panic]
     fn test_alloca_unwind() {
         unsafe {
-            with_alloca_raw(24, |ptr| panic!("test panic"));
+            with_alloca_raw(24, |_ptr| panic!("test panic"));
         }
     }
 }
