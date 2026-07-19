@@ -1,5 +1,7 @@
 [workspace]
+resolver = "3"
 
 members = [
-    "crates/minalloca"
+    "crates/minalloca",
+    "crates/autobump"
 ]

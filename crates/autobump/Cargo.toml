@@ -1,0 +1,12 @@
+[package]
+name = "autobump"
+version = "0.1.0"
+edition = "2024"
+description = "Scoped bump allocator"
+license = "MIT"
+keywords = ["bump", "heap", "memory"]
+categories = ["memory-management"]
+repository = "https://github.com/pomoke/minalloca"
+
+[dependencies]
+
