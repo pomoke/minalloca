@@ -4,6 +4,7 @@ use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::drop_in_place,
+    thread::panicking,
 };
 
 #[derive(Debug)]
@@ -32,6 +33,13 @@ impl Bump {
         UnsafeBumpScope {
             top: unsafe { *self.current.get() },
             bump: self,
+        }
+    }
+
+    pub fn scope<'a>(&'a self) -> BumpScope<'a> {
+        BumpScope {
+            bump: unsafe { self.unsafe_scope() },
+            current: UnsafeCell::new(self.get_current()),
         }
     }
 
@@ -64,6 +72,28 @@ pub struct UnsafeBumpScope<'a> {
 }
 
 impl<'a> UnsafeBumpScope<'a> {
+    /// Allocate a memory buffer.
+    ///
+    /// Returns `None` if aligning the current pointer or adding the allocation
+    /// size would overflow, or if the allocation would exceed the bump limit.
+    /// A failed allocation does not advance the bump pointer.
+    ///
+    /// It's up to caller to uphold scope rules.
+    #[inline]
+    pub fn checked_alloc(&self, layout: Layout) -> Option<*mut u8> {
+        let align_mask = layout.align() - 1;
+        let current = self.bump.get_current() as usize;
+        let base = current.checked_add(align_mask)? & !align_mask;
+        let next = base.checked_add(layout.size())?;
+
+        if next > self.bump.limit as usize {
+            return None;
+        }
+
+        self.bump.set_current(next as *mut u8);
+        Some(base as *mut u8)
+    }
+
     /// Alloc a memory buffer without checking preconditions.
     ///
     /// The fuction does not provide check for integer overflows
@@ -81,6 +111,11 @@ impl<'a> UnsafeBumpScope<'a> {
 
         base as *mut u8
     }
+
+    /// It's undefined to decllocate a inner scope when outer scope is in use.
+    pub unsafe fn deallocate(&mut self) {
+        self.bump.set_current(self.top);
+    }
 }
 
 /// Dropping this scope restores bump pointer to the saved
@@ -88,16 +123,72 @@ impl<'a> UnsafeBumpScope<'a> {
 /// without any form of runtime check.
 impl<'a> Drop for UnsafeBumpScope<'a> {
     fn drop(&mut self) {
-        self.bump.set_current(self.top);
+        unsafe {
+            self.deallocate();
+        }
     }
 }
 
 pub struct BumpScope<'a> {
     bump: UnsafeBumpScope<'a>,
-    current: *mut u8,
+    current: UnsafeCell<*mut u8>,
+}
+
+impl<'a> BumpScope<'a> {
+    pub fn is_current(&self) -> bool {
+        let ctx_current = unsafe { *self.current.get() };
+        let global_current = self.bump.bump.get_current();
+        ctx_current == global_current
+    }
+
+    /// Though checked, it's up to caller not to use return value
+    /// when referring `BumpScope` goes out.
+    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
+        if !self.is_current() {
+            panic!("Must allocate from the innermost scope")
+        }
+        let ret = self.bump.checked_alloc(layout);
+        unsafe { *self.current.get() = self.bump.bump.get_current() };
+
+        ret.expect("no enough memory from bump")
+    }
+
+    pub fn alloc_ptr<'b>(&'b self, layout: Layout) -> BumpHandle<'b, u8, Self> {
+        BumpHandle {
+            ptr: unsafe { self.alloc_raw(layout) },
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn put<'scope, T>(&'scope self, rhs: T) -> BumpHandle<'scope, T, Self> {
+        let ptr = unsafe { self.alloc_raw(Layout::new::<T>()) } as *mut T;
+        unsafe { *ptr = rhs };
+        BumpHandle {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Deallocate the scope, without checking for preconditions.
+    ///
+    /// It is Undefined to call this function violating scope rules.
+    pub unsafe fn unsafe_release(&mut self) {
+        unsafe {
+            self.bump.deallocate();
+        }
+    }
+}
+
+impl<'a> Drop for BumpScope<'a> {
+    fn drop(&mut self) {
+        if !(self.is_current() || panicking()) {
+            panic!("Drop order violation - release innermost scope first")
+        }
+    }
 }
 
 impl<'a> Scope for UnsafeBumpScope<'a> {}
+impl<'a> Scope for BumpScope<'a> {}
 
 pub struct BumpHandle<'a, T, U: Scope> {
     ptr: *mut T,
