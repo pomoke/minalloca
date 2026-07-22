@@ -1,8 +1,6 @@
-use std::{
-    arch::naked_asm,
-    mem::forget,
-    ptr,
-};
+#![no_std]
+
+use core::{arch::naked_asm, mem::forget, ptr};
 
 /// Allocates `[u8; count]` of memory on stack, then run
 /// the given closure with the allocation.
@@ -27,21 +25,23 @@ where
         // SAFETY: `call_fn` is valid as we have called `forget`.
         alloca_trampoline(count, call_fn as *mut u8, callback_as_c::<F> as *mut u8);
     }
-
 }
 
 #[unsafe(naked)]
-unsafe extern "C-unwind" fn alloca_trampoline(count: usize, callback: *mut u8, call_wrapper: *mut u8) {
+unsafe extern "C" fn alloca_trampoline(
+    count: usize,
+    callback: *mut u8,
+    call_wrapper: *mut u8,
+) {
     naked_asm!(
         ".cfi_startproc",
-        "push rbp", // Epilogue - keep bp
-        ".cfi_def_cfa rsp, 16",  // size of ret and rbp
+        "push rbp",             // Epilogue - keep bp
+        ".cfi_def_cfa rsp, 16", // size of ret and rbp
         ".cfi_offset rbp, -16", // Stack grows down.
         "mov rbp, rsp",
         ".cfi_def_cfa_register rbp",
         "push r12",
         ".cfi_offset r12, -24",
-
         "mov r12, rsp", // Stash original sp on callee-save reg
         "and rsp, -16", // Align sp to 16-bytes
         "sub rsp, rdi", // reserve `count` of size
@@ -51,7 +51,7 @@ unsafe extern "C-unwind" fn alloca_trampoline(count: usize, callback: *mut u8, c
         "call rdx",
         "mov rsp, r12", //restore sp
         "pop r12",
-        "pop rbp",      // restore frame
+        "pop rbp", // restore frame
         ".cfi_def_cfa_register rbp",
         "ret",
         ".cfi_endproc",
@@ -75,9 +75,7 @@ mod tests {
     #[test]
     fn test_alloca_run() {
         unsafe {
-            with_alloca_raw(128, |_ptr| {
-                println!("hello, world!");
-            });
+            with_alloca_raw(128, |_ptr| {});
         }
     }
 
@@ -90,9 +88,7 @@ mod tests {
                     *i = '/' as u8;
                 }
                 let s = str::from_utf8(bytes).unwrap();
-                println!("{}", s);
-
-                println!("hello, world!");
+                assert_eq!(s, "////////////////////////");
             });
         }
     }
