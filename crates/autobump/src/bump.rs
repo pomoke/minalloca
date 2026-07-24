@@ -1,11 +1,58 @@
-use std::{
+use core::{
     alloc::Layout,
     cell::UnsafeCell,
+    error::Error,
+    fmt,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::drop_in_place,
-    thread::panicking,
 };
+use std::thread::panicking;
+
+/// An error returned by the fallible bump allocation methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BumpAllocError {
+    /// Aligning the current address or adding the allocation size overflowed.
+    AddressOverflow,
+    /// The allocation would extend past the bump's backing memory.
+    OutOfMemory,
+    /// An allocation was attempted through a scope that is not innermost,
+    /// or attempt to release non-innermost scope.
+    ScopeOrderViolation,
+}
+
+impl fmt::Display for BumpAllocError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::AddressOverflow => "allocation address overflow",
+            Self::OutOfMemory => "not enough memory in bump allocator",
+            Self::ScopeOrderViolation => "allocation requires the innermost scope",
+        })
+    }
+}
+
+impl Error for BumpAllocError {}
+
+fn try_allocation_range(
+    current: usize,
+    limit: usize,
+    layout: Layout,
+) -> Result<(usize, usize), BumpAllocError> {
+    let align_mask = layout.align() - 1;
+    let base = current
+        .checked_add(align_mask)
+        .ok_or(BumpAllocError::AddressOverflow)?
+        & !align_mask;
+    let next = base
+        .checked_add(layout.size())
+        .ok_or(BumpAllocError::AddressOverflow)?;
+
+    if next > limit {
+        return Err(BumpAllocError::OutOfMemory);
+    }
+
+    Ok((base, next))
+}
 
 #[derive(Debug)]
 pub struct Bump {
@@ -22,13 +69,19 @@ impl Bump {
     /// - The memory range specified by pointers must be valid.
     /// - `from <= to`
     /// - During `Bump` valid, the backlying range cannot be aliased or released.
-    pub unsafe fn unsafe_new(from: *mut u8, to: *mut u8) -> Self {
+    pub unsafe fn unsafe_new(from: *mut u8, len: usize) -> Self {
         Self {
             current: UnsafeCell::new(from),
-            limit: to,
+            limit: unsafe { from.add(len) },
         }
     }
 
+    /// Create a scope without enabling allocation-order checks.
+    ///
+    /// # Safety
+    ///
+    /// Scopes must be released in a subsequence of LIFO order, as documented
+    /// on [`UnsafeBumpScope`].
     pub unsafe fn unsafe_scope<'a>(&'a self) -> UnsafeBumpScope<'a> {
         UnsafeBumpScope {
             top: unsafe { *self.current.get() },
@@ -72,32 +125,37 @@ pub struct UnsafeBumpScope<'a> {
 }
 
 impl<'a> UnsafeBumpScope<'a> {
-    /// Allocate a memory buffer.
+    /// Try to allocate a memory buffer.
     ///
-    /// Returns `None` if aligning the current pointer or adding the allocation
-    /// size would overflow, or if the allocation would exceed the bump limit.
+    /// This checks address arithmetic and the bump's backing-memory boundary,
+    /// but deliberately does not check scope allocation order.
     /// A failed allocation does not advance the bump pointer.
     ///
     /// It's up to caller to uphold scope rules.
     #[inline]
-    pub fn checked_alloc(&self, layout: Layout) -> Option<*mut u8> {
-        let align_mask = layout.align() - 1;
-        let current = self.bump.get_current() as usize;
-        let base = current.checked_add(align_mask)? & !align_mask;
-        let next = base.checked_add(layout.size())?;
-
-        if next > self.bump.limit as usize {
-            return None;
-        }
+    pub fn try_alloc(&self, layout: Layout) -> Result<*mut u8, BumpAllocError> {
+        let (base, next) = try_allocation_range(
+            self.bump.get_current() as usize,
+            self.bump.limit as usize,
+            layout,
+        )?;
 
         self.bump.set_current(next as *mut u8);
-        Some(base as *mut u8)
+        Ok(base as *mut u8)
     }
 
-    /// Alloc a memory buffer without checking preconditions.
+    /// Allocate a memory buffer, returning `None` on overflow or exhaustion.
+    #[inline]
+    pub fn checked_alloc(&self, layout: Layout) -> Option<*mut u8> {
+        self.try_alloc(layout).ok()
+    }
+
+    /// Allocate a memory buffer without checking address arithmetic or bounds.
     ///
-    /// The fuction does not provide check for integer overflows
-    /// or , and is unsafe.
+    /// # Safety
+    ///
+    /// The caller must ensure the aligned allocation fits in the bump's
+    /// backing memory and must uphold the scope-order rules.
     #[inline]
     pub unsafe fn unsafe_alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
@@ -112,7 +170,12 @@ impl<'a> UnsafeBumpScope<'a> {
         base as *mut u8
     }
 
-    /// It's undefined to decllocate a inner scope when outer scope is in use.
+    /// Deallocate this scope without checking its position in the scope stack.
+    ///
+    /// # Safety
+    ///
+    /// This scope must be eligible for release according to the scope-order
+    /// rules, and no released allocation may be used afterward.
     pub unsafe fn deallocate(&mut self) {
         self.bump.set_current(self.top);
     }
@@ -141,37 +204,71 @@ impl<'a> BumpScope<'a> {
         ctx_current == global_current
     }
 
-    /// Though checked, it's up to caller not to use return value
-    /// when referring `BumpScope` goes out.
-    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
+    /// Try to allocate raw memory from this scope.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer must not be used after this `BumpScope` goes out
+    /// of scope.
+    pub unsafe fn try_alloc_raw(&self, layout: Layout) -> Result<*mut u8, BumpAllocError> {
         if !self.is_current() {
-            panic!("Must allocate from the innermost scope")
+            return Err(BumpAllocError::ScopeOrderViolation);
         }
-        let ret = self.bump.checked_alloc(layout);
-        unsafe { *self.current.get() = self.bump.bump.get_current() };
 
-        ret.expect("no enough memory from bump")
+        let ptr = self.bump.try_alloc(layout)?;
+        unsafe { *self.current.get() = self.bump.bump.get_current() };
+        Ok(ptr)
+    }
+
+    /// Allocate raw memory, panicking if the allocation fails.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer must not be used after this `BumpScope` goes out
+    /// of scope.
+    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
+        unsafe { self.try_alloc_raw(layout) }
+            .unwrap_or_else(|error| panic!("failed to allocate from bump: {error}"))
+    }
+
+    pub fn try_alloc_ptr<'b>(
+        &'b self,
+        layout: Layout,
+    ) -> Result<BumpHandle<'b, u8, Self>, BumpAllocError> {
+        Ok(BumpHandle {
+            ptr: unsafe { self.try_alloc_raw(layout)? },
+            _marker: PhantomData,
+        })
     }
 
     pub fn alloc_ptr<'b>(&'b self, layout: Layout) -> BumpHandle<'b, u8, Self> {
-        BumpHandle {
-            ptr: unsafe { self.alloc_raw(layout) },
+        self.try_alloc_ptr(layout)
+            .unwrap_or_else(|error| panic!("failed to allocate from bump: {error}"))
+    }
+
+    pub fn try_put<'scope, T>(
+        &'scope self,
+        rhs: T,
+    ) -> Result<BumpHandle<'scope, T, Self>, BumpAllocError> {
+        let ptr = unsafe { self.try_alloc_raw(Layout::new::<T>())? } as *mut T;
+        unsafe { ptr.write(rhs) };
+        Ok(BumpHandle {
+            ptr,
             _marker: PhantomData,
-        }
+        })
     }
 
     pub fn put<'scope, T>(&'scope self, rhs: T) -> BumpHandle<'scope, T, Self> {
-        let ptr = unsafe { self.alloc_raw(Layout::new::<T>()) } as *mut T;
-        unsafe { *ptr = rhs };
-        BumpHandle {
-            ptr,
-            _marker: PhantomData,
-        }
+        self.try_put(rhs)
+            .unwrap_or_else(|error| panic!("failed to allocate from bump: {error}"))
     }
 
     /// Deallocate the scope, without checking for preconditions.
     ///
-    /// It is Undefined to call this function violating scope rules.
+    /// # Safety
+    ///
+    /// This scope must be eligible for release according to the scope-order
+    /// rules, and no released allocation may be used afterward.
     pub unsafe fn unsafe_release(&mut self) {
         unsafe {
             self.bump.deallocate();
@@ -181,7 +278,11 @@ impl<'a> BumpScope<'a> {
 
 impl<'a> Drop for BumpScope<'a> {
     fn drop(&mut self) {
-        if !(self.is_current() || panicking()) {
+        #[cfg(not(feature = "no_std"))]
+        let normal = self.is_current() || panicking();
+        #[cfg(feature = "no_std")]
+        let normal = self.is_current();
+        if !normal {
             panic!("Drop order violation - release innermost scope first")
         }
     }
@@ -213,5 +314,28 @@ impl<'a, T, U: Scope> Drop for BumpHandle<'a, T, U> {
         unsafe {
             drop_in_place(self.ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_range_reports_alignment_overflow() {
+        let layout = Layout::from_size_align(0, 8).unwrap();
+        assert_eq!(
+            try_allocation_range(usize::MAX - 3, usize::MAX, layout),
+            Err(BumpAllocError::AddressOverflow),
+        );
+    }
+
+    #[test]
+    fn allocation_range_reports_size_overflow() {
+        let layout = Layout::from_size_align(2, 1).unwrap();
+        assert_eq!(
+            try_allocation_range(usize::MAX - 1, usize::MAX, layout),
+            Err(BumpAllocError::AddressOverflow),
+        );
     }
 }

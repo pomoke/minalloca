@@ -10,3 +10,6 @@ repository = "https://github.com/pomoke/minalloca"
 
 [dependencies]
 
+[features]
+# `no_std` (core) usage only.
+no_std = []
