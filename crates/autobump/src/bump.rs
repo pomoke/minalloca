@@ -1,11 +1,5 @@
 use core::{
-    alloc::Layout,
-    cell::UnsafeCell,
-    error::Error,
-    fmt,
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-    ptr::drop_in_place,
+    alloc::Layout, cell::UnsafeCell, error::Error, fmt, marker::PhantomData, mem::MaybeUninit, ops::{Deref, DerefMut, Index}, ptr::{self, NonNull, drop_in_place}, slice::{from_raw_parts, from_raw_parts_mut},
 };
 use std::thread::panicking;
 
@@ -220,7 +214,7 @@ impl<'a> BumpScope<'a> {
         Ok(ptr)
     }
 
-    /// Allocate raw memory, panicking if the allocation fails.
+    /// Allocate raw memory, panic if the allocation fails.
     ///
     /// # Safety
     ///
@@ -241,6 +235,7 @@ impl<'a> BumpScope<'a> {
         })
     }
 
+    /// Allocate a handle of.
     pub fn alloc_ptr<'b>(&'b self, layout: Layout) -> BumpHandle<'b, u8, Self> {
         self.try_alloc_ptr(layout)
             .unwrap_or_else(|error| panic!("failed to allocate from bump: {error}"))
@@ -291,6 +286,13 @@ impl<'a> Drop for BumpScope<'a> {
 impl<'a> Scope for UnsafeBumpScope<'a> {}
 impl<'a> Scope for BumpScope<'a> {}
 
+/// Handle of allocation for **`Sized`** type, bound to a `Scope`.
+///
+/// This handle prevents underlying scope to drop early.
+/// Data is accessed by `Deref` and `DerefMut`.
+///
+/// Drops underlying data when going out of scope. To avoid automatically dropping,
+/// use `ManuallyDrop<T>` for `T`.
 pub struct BumpHandle<'a, T, U: Scope> {
     ptr: *mut T,
     _marker: PhantomData<&'a U>,
@@ -313,6 +315,55 @@ impl<'a, T, U: Scope> Drop for BumpHandle<'a, T, U> {
     fn drop(&mut self) {
         unsafe {
             drop_in_place(self.ptr);
+        }
+    }
+}
+
+pub struct BumpSliceRawHandle<'a, T, U: Scope> {
+    ptr: NonNull<MaybeUninit<T>>,
+    len: usize,
+    _marker: PhantomData<&'a U>,
+}
+
+impl<'a, T, U: Scope> Deref for BumpSliceRawHandle<'a, T, U> {
+    type Target = [MaybeUninit<T>];
+    fn deref(&self) -> &Self::Target {
+        unsafe { from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<'a, T, U: Scope> DerefMut for BumpSliceRawHandle<'a, T, U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+/// `Vec<T>` with initialized items accessible directly over Bump.
+/// Only a subset of methods are provided compared to `std::vec::Vec`.
+pub struct BumpSliceHandle<'a, T, U: Scope> {
+    ptr: NonNull<T>,
+    len: usize,
+    inited_len: usize,
+    _marker: PhantomData<&'a U>,
+}
+
+impl<'a, T, U: Scope> Deref for BumpSliceHandle<'a, T, U> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        unsafe { from_raw_parts(self.ptr.as_ptr(), self.inited_len) }
+    }
+}
+
+impl<'a, T, U: Scope> DerefMut for BumpSliceHandle<'a, T, U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.inited_len) }
+    }
+}
+
+impl<'a, T, U: Scope> Drop for BumpSliceHandle<'a, T, U> {
+    fn drop(&mut self) {
+        unsafe {
+            drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.inited_len));
         }
     }
 }
